@@ -1,0 +1,79 @@
+# Web build — free public-repo runner; produces a static Expo web export.
+#
+# The app source lives in a PRIVATE repo. It is cloned into the runner with a
+# READ-ONLY deploy key, exported, and destroyed with the runner. Nothing from it
+# is committed here and nothing is uploaded as an Actions artifact (those are
+# public on a public repo). The tarball goes to private R2 storage under
+# builds:<app>/web/.
+
+name: Build Web
+run-name: "Build Web · ${{ inputs.ref }} · ${{ inputs.correlation || 'manual' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source branch/tag/SHA to build"
+        default: v4
+      correlation:
+        description: "Correlation id (leave blank when dispatching by hand)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-${{ inputs.ref }}
+  cancel-in-progress: true
+
+env:
+  SRC: src
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out app source (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_REPO_SSH_KEY }}
+          path: ${{ env.SRC }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ env.SRC }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.SRC }}
+        run: npm ci --no-audit --no-fund
+
+      - name: Export static web build
+        working-directory: ${{ env.SRC }}
+        env:
+          CI: "1"
+        run: npx expo export -p web --output-dir "$RUNNER_TEMP/web"
+
+      - name: Upload to private artifact storage
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_ONEDRIVE }}
+        run: |
+          set -euo pipefail
+          : "${RCLONE_CONF:?RCLONE_CONFIG_ONEDRIVE is unset}"
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1
+          app="${GITHUB_REPOSITORY##*/}"; app="${app%-deploy}"
+          rev="$(git -C "$SRC" rev-parse --short HEAD)"
+          stamp="$(TZ=Asia/Kolkata date '+%Y%m%d-%H%M')"
+          name="${app}-web-${stamp}-${rev}-run${GITHUB_RUN_NUMBER}.tar.gz"
+          tar -C "$RUNNER_TEMP/web" -czf "$RUNNER_TEMP/$name" .
+          ( cd "$RUNNER_TEMP" && sha256sum "$name" > "$name.sha256" )
+          conf="$RUNNER_TEMP/rclone.conf"; printf '%s' "$RCLONE_CONF" > "$conf"; chmod 600 "$conf"
+          rclone --config "$conf" copyto "$RUNNER_TEMP/$name" "builds:${app}/web/${name}" --no-traverse
+          rclone --config "$conf" copyto "$RUNNER_TEMP/$name.sha256" "builds:${app}/web/${name}.sha256" --no-traverse
+          rm -f "$conf"
+          echo "### Web build uploaded: \`${app}/web/${name}\` (source \`${rev}\`)" >> "$GITHUB_STEP_SUMMARY"
